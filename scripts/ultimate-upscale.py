@@ -6,6 +6,8 @@ from modules.processing import StableDiffusionProcessing
 from modules.processing import Processed
 from modules.shared import opts, state
 from enum import Enum
+import torch
+from torchvision.transforms.functional import to_tensor, to_pil_image
 
 elem_id_prefix = "ultimateupscale"
 
@@ -19,6 +21,7 @@ class USDUSFMode(Enum):
     BAND_PASS = 1
     HALF_TILE = 2
     HALF_TILE_PLUS_INTERSECTIONS = 3
+
 
 class USDUpscaler():
 
@@ -38,6 +41,13 @@ class USDUpscaler():
         self.initial_info = None
         self.rows = math.ceil(self.p.height / self.redraw.tile_height)
         self.cols = math.ceil(self.p.width / self.redraw.tile_width)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.mixed_precision = False
+        self.force_fp32 = False
+        self.scaler = torch.cuda.amp.GradScaler()
+
+    def check_nan(self, tensor):
+        return torch.isnan(tensor).any().item()
 
     def get_factor(self, num):
         # Its just return, don't need elif
@@ -66,6 +76,28 @@ class USDUpscaler():
                 break
         self.scales = enumerate(scales)
 
+    def mixed_precision_upscale(self, image, scale_factor):
+        input_tensor = to_tensor(image).unsqueeze(0).to(self.device)
+
+        try:
+            with torch.cuda.amp.autocast(enabled=self.mixed_precision and not self.force_fp32):
+                input_image = to_pil_image(input_tensor.squeeze(0).cpu())
+                output_image = self.upscaler.scaler.upscale(input_image, scale_factor, self.upscaler.data_path)
+                output_tensor = to_tensor(output_image).unsqueeze(0).to(self.device)
+
+            if self.check_nan(output_tensor):
+                raise RuntimeError("NaN detected in output tensor")
+
+        except RuntimeError as e:
+            print(f"Warning: {str(e)}. Falling back to FP32.")
+            # Fallback to FP32
+            with torch.cuda.amp.autocast(enabled=False):
+                input_image = to_pil_image(input_tensor.squeeze(0).cpu())
+                output_image = self.upscaler.scaler.upscale(input_image, scale_factor, self.upscaler.data_path)
+                output_tensor = to_tensor(output_image).unsqueeze(0).to(self.device)
+
+        return to_pil_image(output_tensor.squeeze(0).cpu())
+
     def upscale(self):
         # Log info
         print(f"Canva size: {self.p.width}x{self.p.height}")
@@ -76,12 +108,20 @@ class USDUpscaler():
             self.image = self.image.resize((self.p.width, self.p.height), resample=Image.LANCZOS)
             return
         # Get list with scale factors
+        print(f"Upscaling with mixed precision: {self.mixed_precision}")
+        print(f"Force FP32: {self.force_fp32}")
         self.get_factors()
         # Upscaling image over all factors
         for index, value in self.scales:
             print(f"Upscaling iteration {index+1} with scale factor {value}")
-            self.image = self.upscaler.scaler.upscale(self.image, value, self.upscaler.data_path)
-        # Resize image to set values
+            if self.mixed_precision and not self.force_fp32:
+                self.image = self.mixed_precision_upscale(self.image, value)
+            else:
+                self.image = self.upscaler.scaler.upscale(self.image, value, self.upscaler.data_path)
+
+        if isinstance(self.image, torch.Tensor):
+            self.image = to_pil_image(self.image.squeeze(0).cpu())
+
         self.image = self.image.resize((self.p.width, self.p.height), resample=Image.LANCZOS)
 
     def setup_redraw(self, redraw_mode, padding, mask_blur):
@@ -263,8 +303,8 @@ class USDUSeamsFix():
         row_gradient.paste(gradient.resize(
             (self.tile_width, self.tile_height//2), resample=Image.BICUBIC), (0, 0))
         row_gradient.paste(gradient.rotate(180).resize(
-                (self.tile_width, self.tile_height//2), resample=Image.BICUBIC),
-                (0, self.tile_height//2))
+            (self.tile_width, self.tile_height//2), resample=Image.BICUBIC),
+            (0, self.tile_height//2))
         col_gradient = Image.new("L", (self.tile_width, self.tile_height), "black")
         col_gradient.paste(gradient.rotate(90).resize(
             (self.tile_width//2, self.tile_height), resample=Image.BICUBIC), (0, 0))
@@ -369,7 +409,7 @@ class USDUSeamsFix():
 
         for xi in range(1, rows):
             if state.interrupted:
-                    break
+                break
             p.width = self.width + self.padding * 2
             p.height = image.height
             p.inpaint_full_res = True
@@ -384,7 +424,7 @@ class USDUSeamsFix():
                 image = processed.images[0]
         for yi in range(1, cols):
             if state.interrupted:
-                    break
+                break
             p.width = image.width
             p.height = self.width + self.padding * 2
             p.inpaint_full_res = True
@@ -448,7 +488,7 @@ class Script(scripts.Script):
 
         with gr.Row():
             target_size_type = gr.Dropdown(label="Target size type", elem_id=f"{elem_id_prefix}_target_size_type", choices=[k for k in target_size_types], type="index",
-                                  value=next(iter(target_size_types)))
+                                           value=next(iter(target_size_types)))
 
             custom_width = gr.Slider(label='Custom width', elem_id=f"{elem_id_prefix}_custom_width", minimum=64, maximum=8192, step=64, value=2048, visible=False, interactive=True)
             custom_height = gr.Slider(label='Custom height', elem_id=f"{elem_id_prefix}_custom_height", minimum=64, maximum=8192, step=64, value=2048, visible=False, interactive=True)
@@ -457,7 +497,7 @@ class Script(scripts.Script):
         gr.HTML("<p style=\"margin-bottom:0.75em\">Redraw options:</p>")
         with gr.Row():
             upscaler_index = gr.Radio(label='Upscaler', elem_id=f"{elem_id_prefix}_upscaler_index", choices=[x.name for x in shared.sd_upscalers],
-                                value=shared.sd_upscalers[0].name, type="index")
+                                      value=shared.sd_upscalers[0].name, type="index")
         with gr.Row():
             redraw_mode = gr.Dropdown(label="Type", elem_id=f"{elem_id_prefix}_redraw_mode", choices=[k for k in redrow_modes], type="index", value=next(iter(redrow_modes)))
             tile_width = gr.Slider(elem_id=f"{elem_id_prefix}_tile_width", minimum=0, maximum=2048, step=64, label='Tile width', value=512)
@@ -475,6 +515,8 @@ class Script(scripts.Script):
         with gr.Row():
             save_upscaled_image = gr.Checkbox(label="Upscaled", elem_id=f"{elem_id_prefix}_save_upscaled_image", value=True)
             save_seams_fix_image = gr.Checkbox(label="Seams fix", elem_id=f"{elem_id_prefix}_save_seams_fix_image", value=False)
+            use_mixed_precision = gr.Checkbox(label="Use Mixed Precision", elem_id=f"{elem_id_prefix}_use_mixed_precision", value=False)
+            force_fp32 = gr.Checkbox(label="Force FP32 Computation", elem_id=f"{elem_id_prefix}_force_fp32", value=False)
 
         def select_fix_type(fix_index):
             all_visible = fix_index != 0
@@ -519,11 +561,11 @@ class Script(scripts.Script):
 
         return [info, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
                 upscaler_index, save_upscaled_image, redraw_mode, save_seams_fix_image, seams_fix_mask_blur,
-                seams_fix_type, target_size_type, custom_width, custom_height, custom_scale]
+                seams_fix_type, target_size_type, custom_width, custom_height, custom_scale, use_mixed_precision, force_fp32]
 
     def run(self, p, _, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
             upscaler_index, save_upscaled_image, redraw_mode, save_seams_fix_image, seams_fix_mask_blur,
-            seams_fix_type, target_size_type, custom_width, custom_height, custom_scale):
+            seams_fix_type, target_size_type, custom_width, custom_height, custom_scale, use_mixed_precision, force_fp32):
 
         # Init
         processing.fix_seed(p)
@@ -555,8 +597,10 @@ class Script(scripts.Script):
 
         # Upscaling
         upscaler = USDUpscaler(p, init_img, upscaler_index, save_upscaled_image, save_seams_fix_image, tile_width, tile_height)
+        upscaler.mixed_precision = use_mixed_precision
+        upscaler.force_fp32 = force_fp32
         upscaler.upscale()
-        
+
         # Drawing
         upscaler.setup_redraw(redraw_mode, padding, mask_blur)
         upscaler.setup_seams_fix(seams_fix_padding, seams_fix_denoise, seams_fix_mask_blur, seams_fix_width, seams_fix_type)
@@ -566,4 +610,3 @@ class Script(scripts.Script):
         result_images = upscaler.result_images
 
         return Processed(p, result_images, seed, upscaler.initial_info if upscaler.initial_info is not None else "")
-
